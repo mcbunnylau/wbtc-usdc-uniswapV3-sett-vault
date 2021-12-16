@@ -19,5 +19,11 @@
       "pre-commit": "yarn lint:fix",
       "commit-msg": "commitlint -E HUSKY_GIT_PARAMS"
     }
+  },
+  "dependencies": {
+    "@uniswap/v3-core": "^1.0.0",
+    "@uniswap/v3-periphery": "^1.3.0",
+    "brownie": "^0.9.9",
+    "ganache-cli": "^6.12.2"
   }
 }

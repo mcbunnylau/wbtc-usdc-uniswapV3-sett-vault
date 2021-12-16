@@ -2,18 +2,23 @@
 
 pragma solidity ^0.6.11;
 
-import "../../deps/@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
-import "../../deps/@openzeppelin/contracts-upgradeable/math/SafeMathUpgradeable.sol";
-import "../../deps/@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
-import "../../deps/@openzeppelin/contracts-upgradeable/token/ERC20/SafeERC20Upgradeable.sol";
-import "../../deps/@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
-import "../../deps/@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "../../deps/@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "../deps/@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "../deps/@openzeppelin/contracts-upgradeable/math/SafeMathUpgradeable.sol";
+import "../deps/@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
+import "../deps/@openzeppelin/contracts-upgradeable/token/ERC20/SafeERC20Upgradeable.sol";
+import "../deps/@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
+import "../deps/@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "../deps/@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
-import "interfaces/badger/IController.sol";
-import "interfaces/erc20/IERC20Detailed.sol";
-import "../../deps/SettAccessControlDefended.sol";
-import "interfaces/yearn/BadgerGuestlistApi.sol";
+import "../interfaces/badger/IController.sol";
+import "../interfaces/erc20/IERC20Detailed.sol";
+import "../deps/SettAccessControlDefended.sol";
+import "../interfaces/yearn/BadgerGuestlistApi.sol";
+
+import "@uniswap/v3-periphery/contracts/libraries/PositionKey.sol";
+import "@uniswap/v3-periphery/contracts/libraries/LiquidityAmounts.sol";
+import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
+import "@uniswap/v3-core/contracts/libraries/TickMath.sol";
 
 /* 
     Source: https://github.com/iearn-finance/yearn-protocol/blob/develop/contracts/vaults/yVault.sol
@@ -37,9 +42,13 @@ import "interfaces/yearn/BadgerGuestlistApi.sol";
 
     V1.4
     * Add depositFor() to deposit on the half of other users. That user will then be blockLocked.
+
+    V1.4-UniswapV3
+    * Modified deposit and withdraw functions to match paired deposits.
+    * Added a new function to facilitate strategy function calls like rebalancing.
 */
 
-contract SettV4 is
+contract SettV4UniswapV3 is
   ERC20Upgradeable,
   SettAccessControlDefended,
   PausableUpgradeable
@@ -48,7 +57,16 @@ contract SettV4 is
   using AddressUpgradeable for address;
   using SafeMathUpgradeable for uint256;
 
-  IERC20Upgradeable public token;
+  IUniswapV3Pool public immutable pool; // pool of Uniswap V3 tokens pair
+
+  IERC20Upgradeable public token0; // token0 of paired token
+  IERC20Upgradeable public token1; // token1 of paired token
+
+  // position range for
+  int24 public baseLower;
+  int24 public baseUpper;
+  int24 public limitLower;
+  int24 public limitUpper;
 
   uint256 public min;
   uint256 public constant max = 10000;
@@ -71,7 +89,7 @@ contract SettV4 is
   );
 
   function initialize(
-    address _token,
+    address _pool,
     address _controller,
     address _governance,
     address _keeper,
@@ -97,7 +115,9 @@ contract SettV4 is
 
     __ERC20_init(name, symbol);
 
-    token = IERC20Upgradeable(_token);
+    pool = IUniswapV3Pool(_pool);
+    token0 = IERC20Upgradeable(IUniswapV3Pool(_pool).token0());
+    token1 = IERC20Upgradeable(IUniswapV3Pool(_pool).token1());
     governance = _governance;
     strategist = address(0);
     keeper = _keeper;
@@ -129,54 +149,124 @@ contract SettV4 is
   /// ===== View Functions =====
 
   function version() public view returns (string memory) {
-    return "1.4";
+    return "1.4-UniswapV3";
   }
 
-  function getPricePerFullShare() public view virtual returns (uint256) {
+  // prices for the pair per full share e.g. WBTC and USDC
+  function getPricePerFullShare()
+    public
+    view
+    virtual
+    returns (uint256 _amount0, uint256 _amount1)
+  {
     if (totalSupply() == 0) {
       return 1e18;
     }
-    return balance().mul(1e18).div(totalSupply());
+    _amount0 = balance(address(token0)).mul(1e18).div(totalSupply());
+    _amount1 = balance(address(token1)).mul(1e18).div(totalSupply());
   }
 
   /// @notice Return the total balance of the underlying token within the system
   /// @notice Sums the balance in the Sett, the Controller, and the Strategy
-  function balance() public view virtual returns (uint256) {
+  /// @notice Return the balance based on the address specified in the input variables
+  function balance(address _token) public view virtual returns (uint256) {
+    IERC20Upgradeable __token = IERC20Upgradeable(_token);
     return
-      token.balanceOf(address(this)).add(
-        IController(controller).balanceOf(address(token))
+      __token.balanceOf(address(this)).add(
+        IController(controller).balanceOf(address(__token))
       );
   }
 
   /// @notice Defines how much of the Setts' underlying can be borrowed by the Strategy for use
   /// @notice Custom logic in here for how much the vault allows to be borrowed
   /// @notice Sets minimum required on-hand to keep small withdrawals cheap
-  function available() public view virtual returns (uint256) {
-    return token.balanceOf(address(this)).mul(min).div(max);
+  function available()
+    public
+    view
+    virtual
+    returns (uint256 _amount0, uint256 _amount1)
+  {
+    _amount0 = token0.balanceOf(address(this)).mul(min).div(max);
+    _amount1 = token1.balanceOf(address(this)).mul(min).div(max);
+  }
+
+  /// @notice Calculates the vault's total holdings of token0 and token1 - in
+  // other words, how much of each token the vault would hold if it withdrew
+  // all its liquidity from Uniswap.
+  function getTotalAmounts()
+    public
+    view
+    override
+    returns (uint256 total0, uint256 total1)
+  {
+    (uint256 baseAmount0, uint256 baseAmount1) =
+      getPositionAmounts(baseLower, baseUpper);
+    (uint256 limitAmount0, uint256 limitAmount1) =
+      getPositionAmounts(limitLower, limitUpper);
+    total0 = getBalance0().add(baseAmount0).add(limitAmount0);
+    total1 = getBalance1().add(baseAmount1).add(limitAmount1);
+  }
+
+  /// @notice Amounts of token0 and token1 held in vault's position
+  function getPositionAmounts(int24 tickLower, int24 tickUpper)
+    public
+    view
+    returns (uint256 amount0, uint256 amount1)
+  {
+    // get amount of liquidity owned by this position, get fees (in tokens) owed to position for token0 and token1 respectively
+    (uint128 liquidity, , , uint128 tokensOwed0, uint128 tokensOwed1) =
+      _position(tickLower, tickUpper);
+    (amount0, amount1) = _amountsForLiquidity(tickLower, tickUpper, liquidity);
+
+    // add fees owed to amount
+    amount0 = amount0.add(uint256(tokensOwed0));
+    amount1 = amount1.add(uint256(tokensOwed1));
+  }
+
+  /// @notice Balance of token0 in vault not used in any strategy
+  function getBalance0() public view returns (uint256) {
+    return token0.balanceOf(address(this));
+  }
+
+  /// @notice Balance of token1 in vault not used in any strategy
+  function getBalance1() public view returns (uint256) {
+    return token1.balanceOf(address(this));
   }
 
   /// ===== Public Actions =====
 
   /// @notice Deposit assets into the Sett, and return corresponding shares to the user
   /// @notice Only callable by EOA accounts that pass the _defend() check
-  function deposit(uint256 _amount) public whenNotPaused {
+  function deposit(
+    uint256 _amount0Desired,
+    uint256 _amount1Desired,
+    uint256 amount0Min,
+    uint256 amount1Min
+  ) public whenNotPaused {
     _defend();
     _blockLocked();
 
     _lockForBlock(msg.sender);
-    _depositWithAuthorization(_amount, new bytes32[](0));
+    _depositWithAuthorization(
+      _amount0Desired,
+      _amount1Desired,
+      new bytes32[](0)
+    );
   }
 
   /// @notice Deposit variant with proof for merkle guest list
-  function deposit(uint256 _amount, bytes32[] memory proof)
-    public
-    whenNotPaused
-  {
+  function deposit(
+    uint256 _amount0Desired,
+    uint256 _amount1Desired,
+    uint256 amount0Min,
+    uint256 amount1Min,
+    bytes32[] memory proof
+  ) public whenNotPaused {
     _defend();
     _blockLocked();
 
     _lockForBlock(msg.sender);
-    _depositWithAuthorization(_amount, proof);
+    _depositWithAuthorization(_amount0Desired, _amount1Desired, proof);
   }
 
   /// @notice Convenience function: Deposit entire balance of asset into the Sett, and return corresponding shares to the user
@@ -186,7 +276,11 @@ contract SettV4 is
     _blockLocked();
 
     _lockForBlock(msg.sender);
-    _depositWithAuthorization(token.balanceOf(msg.sender), new bytes32[](0));
+    _depositWithAuthorization(
+      token0.balanceOf(msg.sender),
+      token1.balanceOf(msg.sender),
+      new bytes32[](0)
+    );
   }
 
   /// @notice DepositAll variant with proof for merkle guest list
@@ -195,33 +289,49 @@ contract SettV4 is
     _blockLocked();
 
     _lockForBlock(msg.sender);
-    _depositWithAuthorization(token.balanceOf(msg.sender), proof);
+    _depositWithAuthorization(
+      token0.balanceOf(msg.sender),
+      token1.balanceOf(msg.sender),
+      proof
+    );
   }
 
   /// @notice Deposit assets into the Sett, and return corresponding shares to the user
   /// @notice Only callable by EOA accounts that pass the _defend() check
-  function depositFor(address _recipient, uint256 _amount)
-    public
-    whenNotPaused
-  {
+  function depositFor(
+    address _recipient,
+    uint256 _amount0Desired,
+    uint256 _amount1Desired
+  ) public whenNotPaused {
     _defend();
     _blockLocked();
 
     _lockForBlock(_recipient);
-    _depositForWithAuthorization(_recipient, _amount, new bytes32[](0));
+    _depositForWithAuthorization(
+      _recipient,
+      _amount0Desired,
+      _amount1Desired,
+      new bytes32[](0)
+    );
   }
 
   /// @notice Deposit variant with proof for merkle guest list
   function depositFor(
     address _recipient,
-    uint256 _amount,
+    uint256 _amount0Desired,
+    uint256 _amount1Desired,
     bytes32[] memory proof
   ) public whenNotPaused {
     _defend();
     _blockLocked();
 
     _lockForBlock(_recipient);
-    _depositForWithAuthorization(_recipient, _amount, proof);
+    _depositForWithAuthorization(
+      _recipient,
+      _amount0Desired,
+      _amount1Desired,
+      proof
+    );
   }
 
   /// @notice No rebalance implementation for lower fees and faster swaps
@@ -315,36 +425,127 @@ contract SettV4 is
   /// @dev Calculate the number of shares to issue for a given deposit
   /// @dev This is based on the realized value of underlying assets between Sett & associated Strategy
   // @dev deposit for msg.sender
-  function _deposit(uint256 _amount) internal {
-    _depositFor(msg.sender, _amount);
+  function _deposit(uint256 _amount0Desired, uint256 _amount1Desired) internal {
+    _depositFor(msg.sender, _amount0Desired, _amount1Desired);
   }
 
-  function _depositFor(address recipient, uint256 _amount) internal virtual {
-    uint256 _pool = balance();
-    uint256 _before = token.balanceOf(address(this));
-    token.safeTransferFrom(msg.sender, address(this), _amount);
-    uint256 _after = token.balanceOf(address(this));
-    _amount = _after.sub(_before); // Additional check for deflationary tokens
-    uint256 shares = 0;
-    if (totalSupply() == 0) {
-      shares = _amount;
-    } else {
-      shares = (_amount.mul(totalSupply())).div(_pool);
+  function _depositFor(
+    address recipient,
+    uint256 _amount0Desired,
+    uint256 _amount1Desired
+  ) internal virtual {
+    // // for additional checks
+    // uint256 _before0 = token0.balanceOf(address(this)); // balance of token0 of vault before transfer
+    // uint256 _before1 = token1.balanceOf(address(this)); // balance of token1 of vault before transfer
+
+    (uint256 shares, uint256 amount0, uint256 amount1) =
+      _calcSharesAndAmounts(_amount0Desired, _amount1Desired);
+
+    // pull in tokens from sender
+    if (amount0 > 0) {
+      token0.safeTransferFrom(msg.sender, address(this), amount0);
     }
+    if (amount0 > 0) {
+      token1.safeTransferFrom(msg.sender, address(this), amount1);
+    }
+
+    // uint256 _after0 = token0.balanceOf(address(this)); // balance of token0 of vault after transfer
+    // uint256 _after1 = token1.balanceOf(address(this)); // balance of token1 of vault after transfer
+
+    /// @notice not entirely sure how to implement this check so left out for the time being
+    // _amount0 = _after.sub(_before); // Additional check for deflationary tokens
+    // _amount1 = _after.sub(_before); // Additional check for deflationary tokens
+
     _mint(recipient, shares);
   }
 
-  function _depositWithAuthorization(uint256 _amount, bytes32[] memory proof)
+  function _calcSharesAndAmounts(uint256 amount0Desired, uint256 amount1Desired)
     internal
-    virtual
+    view
+    returns (
+      uint256 shares,
+      uint256 amount0,
+      uint256 amount1
+    )
   {
+    uint256 totalSupply = totalSupply(); // total supply of shares
+    (uint256 total0, uint256 total1) = getTotalAmounts();
+
+    // If total supply > 0, vault can't be empty
+    assert(totalSupply == 0 || total0 > 0 || total1 > 0);
+
+    if (totalSupply == 0) {
+      // For first deposit, just use the amounts desired
+      amount0 = amount0Desired;
+      amount1 = amount1Desired;
+      shares = Math.max(amount0, amount1);
+    } else if (total0 == 0) {
+      amount1 = amount1Desired;
+      shares = amount1.mul(totalSupply).div(total1);
+    } else if (total1 == 0) {
+      amount0 = amount0Desired;
+      shares = amount0.mul(totalSupply).div(total0);
+    } else {
+      uint256 cross =
+        Math.min(amount0Desired.mul(total1), amount1Desired.mul(total0));
+      require(cross > 0, "cross");
+
+      // Round up amounts
+      amount0 = cross.sub(1).div(total1).add(1);
+      amount1 = cross.sub(1).div(total0).add(1);
+      shares = cross.mul(totalSupply).div(total0).div(total1);
+    }
+  }
+
+  /// @dev Wrapper around `IUniswapV3Pool.positions()`.
+  function _position(int24 tickLower, int24 tickUpper)
+    internal
+    view
+    returns (
+      uint128,
+      uint256,
+      uint256,
+      uint128,
+      uint128
+    )
+  {
+    bytes32 positionKey =
+      PositionKey.compute(address(this), tickLower, tickUpper);
+    return pool.positions(positionKey);
+  }
+
+  /// @dev Wrapper around `LiquidityAmounts.getAmountsForLiquidity()`.
+  function _amountsForLiquidity(
+    int24 tickLower,
+    int24 tickUpper,
+    uint128 liquidity
+  ) internal view returns (uint256, uint256) {
+    (uint160 sqrtRatioX96, , , , , , ) = pool.slot0();
+    return
+      LiquidityAmounts.getAmountsForLiquidity(
+        sqrtRatioX96,
+        TickMath.getSqrtRatioAtTick(tickLower),
+        TickMath.getSqrtRatioAtTick(tickUpper),
+        liquidity
+      );
+  }
+
+  function _depositWithAuthorization(
+    uint256 _amount0Desired,
+    uint256 _amount1Desired,
+    bytes32[] memory proof
+  ) internal virtual {
     if (address(guestList) != address(0)) {
       require(
-        guestList.authorized(msg.sender, _amount, proof),
+        guestList.authorized(msg.sender, _amount0, proof),
+        "guest-list-authorization"
+      );
+      require(
+        guestList.authorized(msg.sender, _amount1, proof),
         "guest-list-authorization"
       );
     }
-    _deposit(_amount);
+    _deposit(_amount0Desired, _amount1Desired);
   }
 
   function _depositForWithAuthorization(

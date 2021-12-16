@@ -57,6 +57,7 @@ To deploy the demo Badger Strategy in a development environment:
 2. Run Scripts for Deployment
 
 ```
+  source env/Scripts/activate
   brownie run 1_production_deploy.py
 ```
 
